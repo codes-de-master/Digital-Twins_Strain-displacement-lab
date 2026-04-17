@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Find the three main reflected wavelengths in each OSA file and plot them vs strain.
+"""Find the three main reflected wavelengths in each measurement file and plot them vs strain.
 
 The files in this repository use:
 - tab-separated columns
 - commas as decimal separators
 - the first column as wavelength in nm
 
-For this dataset, the three FBG peaks that match the paired CWL files are stored in the
-second signal column after the wavelength column, so ``--signal-column`` defaults to ``2``.
-If your instrument labels channels differently, adjust that flag when running the script.
+By default, the script extracts peaks from the OSA files. For this dataset, the three FBG
+peaks that match the paired CWL files are stored in the second signal column after the
+wavelength column, so ``--signal-column`` defaults to ``2``. If your instrument labels
+channels differently, adjust that flag when running the script.
+
+If you run the script with ``--CWL``, it reads the reflected wavelengths directly from the
+CWL files instead of finding local maxima in the OSA traces.
 
 The default strain step is derived from the experiment constants:
 - fiber length = 36 cm
@@ -28,18 +32,23 @@ DEFAULT_SIGNAL_COLUMN = 2
 DEFAULT_NUM_PEAKS = 3
 DEFAULT_START_STRAIN = 0.0
 DEFAULT_MIN_SEPARATION_NM = 1.0
-DEFAULT_FIBER_LENGTH_CM = 36.0
+DEFAULT_FIBER_LENGTH_CM = 38.0
 DEFAULT_STEP_DISPLACEMENT_UM = 100.0
 DEFAULT_STRAIN_STEP = (
     DEFAULT_STEP_DISPLACEMENT_UM / (DEFAULT_FIBER_LENGTH_CM * 10_000.0) * 1_000_000.0
 )
+DEFAULT_OSA_CSV_OUTPUT = Path("osa_peak_summary.csv")
+DEFAULT_OSA_PLOT_OUTPUT = Path("strain_vs_reflected_wavelength.png")
+DEFAULT_CWL_CSV_OUTPUT = Path("cwl_peak_summary.csv")
+DEFAULT_CWL_PLOT_OUTPUT = Path("cwl_strain_vs_reflected_wavelength.png")
 OSA_FILENAME_RE = re.compile(r"_OSA_(\d{8}_\d{6})\.txt$")
+CWL_FILENAME_RE = re.compile(r"_CWL_(\d{8}_\d{6})\.txt$")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Find the strongest reflected wavelengths in each OSA file and plot "
+            "Find the strongest reflected wavelengths in each measurement file and plot "
             "reflected wavelength versus strain."
         )
     )
@@ -47,7 +56,12 @@ def parse_args() -> argparse.Namespace:
         "--data-dir",
         type=Path,
         default=Path("data"),
-        help="Directory containing the OSA text files (default: %(default)s).",
+        help="Directory containing the OSA and CWL text files (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--CWL",
+        action="store_true",
+        help="Use the wavelengths stored in the CWL files instead of extracting peaks from the OSA files.",
     )
     parser.add_argument(
         "--signal-column",
@@ -88,14 +102,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv-output",
         type=Path,
-        default=Path("osa_peak_summary.csv"),
-        help="CSV file for the extracted peaks (default: %(default)s).",
+        default=None,
+        help=(
+            "CSV file for the extracted peaks. Defaults to "
+            f"{DEFAULT_OSA_CSV_OUTPUT} in OSA mode and {DEFAULT_CWL_CSV_OUTPUT} in CWL mode."
+        ),
     )
     parser.add_argument(
         "--plot-output",
         type=Path,
-        default=Path("strain_vs_reflected_wavelength.png"),
-        help="PNG file for the strain/wavelength plot (default: %(default)s).",
+        default=None,
+        help=(
+            "PNG file for the strain/wavelength plot. Defaults to "
+            f"{DEFAULT_OSA_PLOT_OUTPUT} in OSA mode and {DEFAULT_CWL_PLOT_OUTPUT} in CWL mode."
+        ),
     )
     return parser.parse_args()
 
@@ -111,10 +131,20 @@ def osa_sort_key(path: Path) -> tuple[int, str]:
     return (1, path.name)
 
 
-def find_osa_files(data_dir: Path) -> list[Path]:
-    files = sorted(data_dir.glob("*OSA*.txt"), key=osa_sort_key)
+def cwl_sort_key(path: Path) -> tuple[int, str]:
+    match = CWL_FILENAME_RE.search(path.name)
+    if match:
+        return (0, match.group(1))
+    return (1, path.name)
+
+
+def find_measurement_files(data_dir: Path, use_cwl: bool) -> list[Path]:
+    pattern = "*CWL*.txt" if use_cwl else "*OSA*.txt"
+    sort_key = cwl_sort_key if use_cwl else osa_sort_key
+    files = sorted(data_dir.glob(pattern), key=sort_key)
     if not files:
-        raise FileNotFoundError(f"No OSA files were found in {data_dir}")
+        file_type = "CWL" if use_cwl else "OSA"
+        raise FileNotFoundError(f"No {file_type} files were found in {data_dir}")
     return files
 
 
@@ -142,6 +172,34 @@ def load_signal_trace(path: Path, signal_column: int) -> tuple[list[float], list
         raise ValueError(f"{path} does not contain enough rows to detect peaks.")
 
     return wavelengths, values
+
+
+def load_cwl_peaks(path: Path, num_peaks: int) -> list[tuple[float, float]]:
+    peaks: list[tuple[float, float]] = []
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 4:
+                raise ValueError(
+                    f"{path} line {line_number} has {len(parts)} columns, "
+                    "but at least 4 columns are required in CWL mode."
+                )
+
+            wavelength = parse_decimal(parts[2])
+            value = parse_decimal(parts[3])
+            peaks.append((wavelength, value))
+
+    if len(peaks) < num_peaks:
+        raise ValueError(
+            f"{path} only contains {len(peaks)} peaks while {num_peaks} were requested."
+        )
+
+    return sorted(peaks[:num_peaks], key=lambda peak: peak[0])
 
 
 def find_top_local_maxima(
@@ -175,6 +233,7 @@ def find_top_local_maxima(
 
 def analyze_files(
     files: list[Path],
+    use_cwl: bool,
     signal_column: int,
     num_peaks: int,
     min_separation_nm: float,
@@ -185,13 +244,16 @@ def analyze_files(
 
     for file_index, path in enumerate(files):
         strain = start_strain + file_index * strain_step
-        wavelengths, values = load_signal_trace(path, signal_column)
-        peaks = find_top_local_maxima(
-            wavelengths=wavelengths,
-            values=values,
-            num_peaks=num_peaks,
-            min_separation_nm=min_separation_nm,
-        )
+        if use_cwl:
+            peaks = load_cwl_peaks(path, num_peaks)
+        else:
+            wavelengths, values = load_signal_trace(path, signal_column)
+            peaks = find_top_local_maxima(
+                wavelengths=wavelengths,
+                values=values,
+                num_peaks=num_peaks,
+                min_separation_nm=min_separation_nm,
+            )
         results.append(
             {
                 "file": path.name,
@@ -257,7 +319,7 @@ def r_squared(y_values: list[float], fitted_values: list[float]) -> float:
     return 1.0 - ss_res / ss_tot
 
 
-def plot_results(results: list[dict[str, object]], output_path: Path) -> None:
+def plot_results(results: list[dict[str, object]], output_path: Path, use_cwl: bool) -> None:
     try:
         matplotlib_config_dir = Path(".matplotlib")
         matplotlib_config_dir.mkdir(exist_ok=True)
@@ -293,7 +355,8 @@ def plot_results(results: list[dict[str, object]], output_path: Path) -> None:
 
     plt.xlabel("Strain (microstrain)")
     plt.ylabel("Reflected wavelength (nm)")
-    plt.title("Strain vs reflected wavelength")
+    source_name = "CWL data" if use_cwl else "OSA data"
+    plt.title(f"Strain vs reflected wavelength ({source_name})")
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.legend()
     plt.tight_layout()
@@ -301,8 +364,11 @@ def plot_results(results: list[dict[str, object]], output_path: Path) -> None:
     plt.close()
 
 
-def print_summary(results: list[dict[str, object]], signal_column: int) -> None:
-    print(f"Signal column after wavelength: {signal_column}")
+def print_summary(results: list[dict[str, object]], signal_column: int, use_cwl: bool) -> None:
+    source_name = "CWL peak list" if use_cwl else "OSA trace analysis"
+    print(f"Data source: {source_name}")
+    if not use_cwl:
+        print(f"Signal column after wavelength: {signal_column}")
     print(
         "Strain step derived from "
         f"{DEFAULT_FIBER_LENGTH_CM:.1f} cm fiber length and "
@@ -350,9 +416,18 @@ def main() -> None:
     if args.min_separation_nm <= 0:
         raise SystemExit("--min-separation-nm must be positive.")
 
-    files = find_osa_files(args.data_dir)
+    csv_output = args.csv_output
+    if csv_output is None:
+        csv_output = DEFAULT_CWL_CSV_OUTPUT if args.CWL else DEFAULT_OSA_CSV_OUTPUT
+
+    plot_output = args.plot_output
+    if plot_output is None:
+        plot_output = DEFAULT_CWL_PLOT_OUTPUT if args.CWL else DEFAULT_OSA_PLOT_OUTPUT
+
+    files = find_measurement_files(args.data_dir, args.CWL)
     results = analyze_files(
         files=files,
+        use_cwl=args.CWL,
         signal_column=args.signal_column,
         num_peaks=args.num_peaks,
         min_separation_nm=args.min_separation_nm,
@@ -360,12 +435,12 @@ def main() -> None:
         strain_step=args.strain_step,
     )
 
-    write_csv(results, args.csv_output)
-    plot_results(results, args.plot_output)
-    print_summary(results, args.signal_column)
+    write_csv(results, csv_output)
+    plot_results(results, plot_output, args.CWL)
+    print_summary(results, args.signal_column, args.CWL)
     print()
-    print(f"CSV summary written to: {args.csv_output}")
-    print(f"Plot written to: {args.plot_output}")
+    print(f"CSV summary written to: {csv_output}")
+    print(f"Plot written to: {plot_output}")
 
 
 if __name__ == "__main__":
